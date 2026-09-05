@@ -23,6 +23,30 @@ AI-powered Telegram bot connected to opencode running in Termux.
 | `/new` | Start a new conversation |
 | `/status` | Check session info |
 | `/help` | Show help |
+| `/approve <chat_id>` | Grant access (admin only) |
+| `/deny <chat_id>` | Deny access (admin only) |
+| `/users` | List authorized users with names + chat IDs (admin only) |
+| `/user` | User panel: `/user`, `/user add <chat_id> [name]`, `/user remove <chat_id>` (admin only) |
+| `/revoke <chat_id>` | Revoke access (admin only) |
+| `/task ...` | Manage your tasks |
+
+## Access Control (admin approval — no password)
+
+Access is granted by the **admin** — there is no password.
+
+- When an unauthorized user tries to use the bot, it sends an **access request**
+  to the admin chat with **Approve / Deny** buttons.
+- Approved users are stored in `userchatid.txt`; the admin chat ID lives in
+  `adminchatid.txt` (auto-created from `ADMIN_IDS` on first run).
+- The admin can also approve/deny manually: `/approve <chat_id>` or
+  `/deny <chat_id>`.
+- `/users` (or `/user`) lists every approved user with their **name + chat ID**.
+- Manage approved users from the `/user` panel:
+  - `/user` — list all users
+  - `/user add <chat_id> [name]` — add a user (name auto-fetched if omitted)
+  - `/user remove <chat_id>` — remove a user
+
+`userchatid.txt` stores one user per line as `chat_id  display_name`.
 
 ## Setup
 
@@ -68,7 +92,6 @@ Other optional variables:
 | `BOT_TOKEN` | *(required)* | Telegram bot token |
 | `BOT_SECRET_KEY` | auto-generated | Key used to obfuscate stored data |
 | `ADMIN_IDS` | `8937986952` | Comma-separated admin user IDs |
-| `BOT_PASSWORD` | `sherlock@` | Password to unlock the bot |
 | `OPENCODE_DIR` | `$HOME` | Working directory for opencode |
 | `INSECURE_SSL` | `1` | Bypass SSL verification (MITM networks) |
 | `BOT_API_BASE_URL` | *(empty)* | Optional proxy/tunnel base URL |
@@ -136,6 +159,8 @@ telegram-opencode-bot/
 ├── .secret.key      # Auto-created obfuscation key (chmod 600)
 ├── bot.lock         # Single-instance file lock (auto-created)
 ├── bot.pid          # PID of the running instance (auto-created)
+├── adminchatid.txt  # Admin chat ID for access requests (auto-created)
+├── userchatid.txt   # Authorized user chat IDs (auto-created)
 ├── sessions.json    # Auto-created per-user sessions (obfuscated)
 ├── alerts.log       # Crash / repeated-error ALERT signals
 ├── tests/           # pytest unit tests

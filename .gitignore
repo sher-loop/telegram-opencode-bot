@@ -1,6 +1,8 @@
 # Secrets & runtime data
 .env
 .secret.key
+adminchatid.txt
+userchatid.txt
 bot.log
 sessions.json
 bot.pid

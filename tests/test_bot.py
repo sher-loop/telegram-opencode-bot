@@ -199,3 +199,57 @@ def test_singleton_lock_excludes_second(tmp_path, monkeypatch):
     fh3 = bot.acquire_singleton()
     assert fh3 is not None, "lock must be released when the process dies/ends"
     fh3.close()
+
+
+# ── Access files (adminchatid.txt / userchatid.txt) ──────────────────────────
+def test_auth_loads_from_userchatid(tmp_path, monkeypatch):
+    monkeypatch.setattr(bot, "CHATID_FILE", tmp_path / "userchatid.txt")
+    monkeypatch.setattr(bot, "AUTH_FILE", tmp_path / "users.json")
+    (tmp_path / "userchatid.txt").write_text("111\n222\n")
+    bot.load_auth()
+    assert bot.authorized == {111, 222}
+
+
+def test_auth_saves_to_userchatid(tmp_path, monkeypatch):
+    monkeypatch.setattr(bot, "CHATID_FILE", tmp_path / "userchatid.txt")
+    monkeypatch.setattr(bot, "AUTH_FILE", tmp_path / "users.json")
+    bot.authorized = {3, 1}
+    bot.user_names = {}
+    bot.save_auth()
+    assert (tmp_path / "userchatid.txt").read_text().strip() == "1\n3"
+
+
+def test_auth_loads_names_from_userchatid(tmp_path, monkeypatch):
+    monkeypatch.setattr(bot, "CHATID_FILE", tmp_path / "userchatid.txt")
+    monkeypatch.setattr(bot, "AUTH_FILE", tmp_path / "users.json")
+    (tmp_path / "userchatid.txt").write_text("111 John\n222\n")
+    bot.load_auth()
+    assert bot.authorized == {111, 222}
+    assert bot.user_names.get(111) == "John"
+    assert bot.user_names.get(222) == ""
+
+
+def test_auth_saves_names(tmp_path, monkeypatch):
+    monkeypatch.setattr(bot, "CHATID_FILE", tmp_path / "userchatid.txt")
+    monkeypatch.setattr(bot, "AUTH_FILE", tmp_path / "users.json")
+    bot.authorized = {1, 3}
+    bot.user_names = {1: "Alice", 3: "Bob Jones"}
+    bot.save_auth()
+    lines = (tmp_path / "userchatid.txt").read_text().strip().split("\n")
+    assert "1 Alice" in lines and "3 Bob Jones" in lines
+
+
+def test_revoke_clears_name(tmp_path, monkeypatch):
+    monkeypatch.setattr(bot, "CHATID_FILE", tmp_path / "userchatid.txt")
+    bot.authorized = {5}
+    bot.user_names = {5: "Ed"}
+    bot.revoke(5)
+    assert bot.authorized == set()
+    assert 5 not in bot.user_names
+
+
+def test_admin_chat_created_from_admin_ids(tmp_path, monkeypatch):
+    monkeypatch.setattr(bot, "ADMIN_CHAT_FILE", tmp_path / "adminchatid.txt")
+    monkeypatch.setattr(bot, "ADMIN_IDS", [42])
+    assert bot.load_admin_chat() == 42
+    assert (tmp_path / "adminchatid.txt").read_text().strip() == "42"

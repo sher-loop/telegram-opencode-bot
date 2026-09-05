@@ -26,9 +26,10 @@ try:
 except ImportError:
     pass
 
-from telegram import BotCommand, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -70,7 +71,9 @@ INSECURE_SSL = os.environ.get("INSECURE_SSL", "1") == "1"
 BASE_URL = os.environ.get("BOT_API_BASE_URL", "")
 OPENCODE_DIR = os.environ.get("OPENCODE_DIR", os.path.expanduser("~"))
 SESSION_FILE = Path(__file__).parent / "sessions.json"
-AUTH_FILE = Path(__file__).parent / "users.json"
+AUTH_FILE = Path(__file__).parent / "users.json"   # legacy store (migrated once)
+CHATID_FILE = Path(__file__).parent / "userchatid.txt"   # authorized user chat IDs
+ADMIN_CHAT_FILE = Path(__file__).parent / "adminchatid.txt"  # admin chat ID
 LOCK_FILE = Path(__file__).parent / "bot.lock"
 PID_FILE = Path(__file__).parent / "bot.pid"
 MAX_MSG = 4000
@@ -79,7 +82,6 @@ MEDIA_DIR = Path(tempfile.mkdtemp(prefix="tgbot_media_"))
 
 # ── Access Control ────────────────────────────────────────────────────────────
 ADMIN_IDS = [int(x) for x in os.environ.get("ADMIN_IDS", "8937986952").split(",") if x.strip().isdigit()]
-BOT_PASSWORD = os.environ.get("BOT_PASSWORD", "sherlock@")
 
 # ── Fun status messages (shown while waiting for a reply) ────────────────────
 STATUS_WORDS = [
@@ -242,27 +244,67 @@ async def clear_sid(uid):
 
 
 # ── Auth / Access Control ─────────────────────────────────────────────────────
+# Access is granted by the ADMIN (no passwords). Unauthorized users asking to
+# use the bot trigger an approval request to the admin chat; approving adds the
+# user's chat ID (and display name) to userchatid.txt.
+# Format of userchatid.txt: one line per user -> "chat_id  display_name"
 authorized: set[int] = set()
+user_names: dict[int, str] = {}
 
 
 def load_auth():
-    global authorized
+    global authorized, user_names
+    authorized = set()
+    user_names = {}
+    if CHATID_FILE.exists():
+        for line in CHATID_FILE.read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split(None, 1)
+            if parts[0].lstrip("-").isdigit():
+                cid = int(parts[0])
+                authorized.add(cid)
+                user_names[cid] = parts[1] if len(parts) > 1 else ""
+        return
+    # Migration: import from the legacy users.json store if present
     data = load_stored(AUTH_FILE)
     if isinstance(data, (list, set)):
         try:
             authorized = set(int(x) for x in data)
         except Exception:
             authorized = set()
-    else:
-        authorized = set()
+        save_auth()
 
 
 def save_auth():
-    if not store_obj(AUTH_FILE, sorted(authorized)):
+    try:
+        lines = []
+        for cid in sorted(authorized):
+            name = (user_names.get(cid) or "").strip()
+            lines.append(f"{cid} {name}".rstrip() if name else str(cid))
+        CHATID_FILE.write_text("\n".join(lines) + ("\n" if lines else ""))
+    except Exception as e:
+        log.error(f"Failed to save userchatid.txt: {e}")
         try:
             AUTH_FILE.write_text(json.dumps(sorted(authorized)))
         except Exception:
             pass
+
+
+def load_admin_chat() -> int | None:
+    """Admin chat ID from adminchatid.txt. Falls back to / creates the default."""
+    if ADMIN_CHAT_FILE.exists():
+        txt = ADMIN_CHAT_FILE.read_text().strip()
+        if txt.lstrip("-").isdigit():
+            return int(txt)
+    chat = ADMIN_IDS[0] if ADMIN_IDS else None
+    if chat is not None:
+        try:
+            ADMIN_CHAT_FILE.write_text(str(chat))
+        except Exception:
+            pass
+    return chat
 
 
 def is_admin(uid: int) -> bool:
@@ -273,9 +315,66 @@ def is_authorized(uid: int) -> bool:
     return is_admin(uid) or uid in authorized
 
 
-def authorize(uid: int):
+def authorize(uid: int, name: str = ""):
     authorized.add(uid)
+    if name:
+        user_names[uid] = name
     save_auth()
+
+
+def revoke(uid: int):
+    authorized.discard(uid)
+    user_names.pop(uid, None)
+    save_auth()
+
+
+async def fetch_user_name(ctx, cid) -> str:
+    """Best-effort display name for a chat ID (first/last name, then @username)."""
+    try:
+        c = await ctx.bot.get_chat(cid)
+        name = " ".join(p for p in (c.first_name, getattr(c, "last_name", None)) if p)
+        name = name.strip()
+        if name:
+            return name
+        return f"@{c.username}" if getattr(c, "username", None) else ""
+    except Exception:
+        return ""
+
+
+# ── Access Requests (sent to the admin for approval) ─────────────────────────
+REQUEST_COOLDOWN = 300  # seconds — don't spam the admin with duplicate requests
+pending_requests: dict[int, tuple[float, str]] = {}
+
+
+async def request_access(ctx, cid, uid, name):
+    """Notify the admin that `cid` wants access, with Approve/Deny buttons."""
+    admin_chat = load_admin_chat()
+    if admin_chat is None:
+        log.error("No admin chat configured (set ADMIN_IDS or adminchatid.txt)")
+        return False
+    now = time.time()
+    if now - pending_requests.get(cid, (0, ""))[0] < REQUEST_COOLDOWN:
+        return True  # already requested recently — don't notify again
+    pending_requests[cid] = (now, name)
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Approve", callback_data=f"access:{cid}"),
+         InlineKeyboardButton("🚫 Deny", callback_data=f"deny:{cid}")],
+    ])
+    text = (
+        "🔔 *Access Request*\n\n"
+        f"User: `{esc(name)}`\n"
+        f"User ID: `{uid}`\n"
+        f"Chat ID: `{cid}`\n\n"
+        "Press a button below, or use `/approve <id>` / `/deny <id>`\\."
+    )
+    try:
+        await ctx.bot.send_message(
+            admin_chat, text, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=kb,
+        )
+        return True
+    except Exception as e:
+        log.error(f"Failed to notify admin about access request: {e}")
+        return False
 
 
 # ── Task Management ───────────────────────────────────────────────────────────
@@ -697,19 +796,36 @@ def split_msg(text, mx=MAX_MSG):
 
 
 # ── Handlers ──────────────────────────────────────────────────────────────────
-async def deny(u: Update):
-    await u.message.reply_text(
-        "🔒 *Restricted Access*\n\n"
-        "This bot is *private*\\.\n"
-        "Send the **password** to continue\\.",
-        parse_mode=ParseMode.MARKDOWN_V2,
-    )
+async def deny(u: Update, ctx: ContextTypes.DEFAULT_TYPE = None):
+    """Unauthorized user → request approval from the admin, then reply."""
+    msg = u.effective_message
+    if not msg:
+        return
+    user = u.effective_user
+    name = user.full_name or user.first_name or str(user.id)
+    sent = False
+    if ctx is not None:
+        sent = await request_access(ctx, msg.chat.id, user.id, name)
+    if sent:
+        await msg.reply_text(
+            "🔒 *Access Request Sent\\!*\n\n"
+            "The *admin* has been notified\\.\n"
+            "Wait for approval to use the bot\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+    else:
+        await msg.reply_text(
+            "🔒 *Restricted Access*\n\n"
+            "This bot is *private\\.*\n"
+            "Ask the **admin** to give you access\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
 
 
 async def cmd_chatid(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = u.effective_user.id
     if not is_authorized(uid):
-        await deny(u)
+        await deny(u, ctx)
         return
     cid = u.effective_chat.id
     await u.message.reply_text(
@@ -726,10 +842,14 @@ async def cmd_start(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(uid):
         await u.message.reply_text(
             f"🔒 *Welcome {n}\\!*\n\n"
-            f"This bot is *private* and requires a **password**\\.\n"
-            f"Send the password as a message to unlock\\.\n\n"
-            f"🔑 *Hint\\:* type the secret password here",
+            f"This bot is *private*\\.\n"
+            f"An *access request* will be sent to the **admin**\\.\n"
+            f"Wait for approval to start using it\\.",
             parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        await request_access(
+            ctx, u.effective_chat.id, uid,
+            u.effective_user.full_name or u.effective_user.first_name or str(uid),
         )
         return
     await u.message.reply_text(
@@ -748,7 +868,7 @@ async def cmd_start(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_help(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = u.effective_user.id
     if not is_authorized(uid):
-        await deny(u)
+        await deny(u, ctx)
         return
     await u.message.reply_text(
         "📖 *How it works:*\n\n"
@@ -767,7 +887,7 @@ async def cmd_help(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_new(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = u.effective_user.id
     if not is_authorized(uid):
-        await deny(u)
+        await deny(u, ctx)
         return
     await clear_sid(uid)
     await u.message.reply_text(
@@ -779,7 +899,7 @@ async def cmd_new(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_status(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = u.effective_user.id
     if not is_authorized(uid):
-        await deny(u)
+        await deny(u, ctx)
         return
     async with lock:
         s = sessions.get(uid)
@@ -804,7 +924,7 @@ async def cmd_status(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_task(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = u.effective_user.id
     if not is_authorized(uid):
-        await deny(u)
+        await deny(u, ctx)
         return
     args = ctx.args
 
@@ -884,33 +1004,99 @@ async def _task_list(u: Update, uid: int):
     )
 
 
-async def cmd_login(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def cmd_approve(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = u.effective_user.id
-    if is_authorized(uid):
-        await u.message.reply_text("✅ *Already authorized\\!*", parse_mode=ParseMode.MARKDOWN_V2)
+    if not is_admin(uid):
+        await deny(u, ctx)
         return
-    pw = ctx.args[0] if ctx.args else ""
-    if pw == BOT_PASSWORD:
-        authorize(uid)
-        await u.message.reply_text(
-            "✅ *Access granted\\!* Welcome to OpenCode Bot\\.\n"
-            "Send a message to start\\.",
-            parse_mode=ParseMode.MARKDOWN_V2,
+    args = ctx.args
+    if not args or not args[0].strip().lstrip("-").isdigit():
+        await u.message.reply_text("Usage: `/approve <chat_id>`", parse_mode=ParseMode.MARKDOWN_V2)
+        return
+    target = int(args[0].strip())
+    name = await fetch_user_name(ctx, target)
+    authorize(target, name)
+    shown = esc(name) if name else f"`{target}`"
+    await u.message.reply_text(
+        f"✅ *Access granted* for {shown}\\.",
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+    try:
+        await ctx.bot.send_message(
+            target,
+            "✅ *Access granted\\!* You can now use the bot\\. Send a message to start\\.",
         )
+    except Exception:
+        pass
+
+
+async def cmd_deny(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = u.effective_user.id
+    if not is_admin(uid):
+        await deny(u, ctx)
+        return
+    args = ctx.args
+    if not args or not args[0].strip().lstrip("-").isdigit():
+        await u.message.reply_text("Usage: `/deny <chat_id>`", parse_mode=ParseMode.MARKDOWN_V2)
+        return
+    target = int(args[0].strip())
+    revoke(target)
+    await u.message.reply_text(f"🚫 *Access denied* for `{target}`\\.", parse_mode=ParseMode.MARKDOWN_V2)
+    try:
+        await ctx.bot.send_message(target, "🚫 *Access denied*\\.. Ask the admin again\\.")
+    except Exception:
+        pass
+
+
+async def on_callback(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = u.callback_query
+    if not q:
+        return
+    data = q.data or ""
+    if not data.startswith(("access:", "deny:")):
+        await q.answer()
+        return
+    if not is_admin(u.effective_user.id):
+        await q.answer("Only the admin can approve or deny.", show_alert=True)
+        return
+    try:
+        target = int(data.split(":", 1)[1])
+    except ValueError:
+        await q.answer("Invalid chat ID.", show_alert=True)
+        return
+    if data.startswith("access:"):
+        name = pending_requests.get(target, ("", ""))[1] or ""
+        if not name:
+            name = await fetch_user_name(ctx, target)
+        authorize(target, name)
+        shown = esc(name) if name else f"`{target}`"
+        await q.edit_message_text(f"✅ *Access granted\\:* {shown}")
+        try:
+            await ctx.bot.send_message(
+                target,
+                "✅ *Access granted\\!* You can now use the bot\\. Send a message to start\\.",
+            )
+        except Exception:
+            pass
     else:
-        await u.message.reply_text("❌ *Wrong password*\\. Try again\\.", parse_mode=ParseMode.MARKDOWN_V2)
+        revoke(target)
+        await q.edit_message_text("🚫 *Access denied\\..*")
+        try:
+            await ctx.bot.send_message(target, "🚫 *Access denied\\..* Ask the admin again\\.")
+        except Exception:
+            pass
+    await q.answer()
 
 
 async def cmd_revoke(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = u.effective_user.id
     if not is_admin(uid):
-        await deny(u)
+        await deny(u, ctx)
         return
     args = ctx.args
     if args and args[0].strip().isdigit():
         target = int(args[0])
-        authorized.discard(target)
-        save_auth()
+        revoke(target)
         await u.message.reply_text(f"🔓 Access revoked for `{target}`\\.", parse_mode=ParseMode.MARKDOWN_V2)
     else:
         await u.message.reply_text(
@@ -919,20 +1105,91 @@ async def cmd_revoke(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
 
 
-async def cmd_users(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = u.effective_user.id
-    if not is_admin(uid):
-        await deny(u)
-        return
-    users = sorted(authorized)
-    if users:
-        lines = "\n".join(f"`{x}`" for x in users)
+async def _user_list(u: Update):
+    """Show every authorized user with name + chat ID."""
+    if authorized:
+        lines = []
+        for cid in sorted(authorized):
+            name = (user_names.get(cid) or "").strip()
+            nm = esc(name) if name else "*unknown*"
+            lines.append(f"`{cid}` \\- {nm}")
         await u.message.reply_text(
-            f"👥 *Authorized Users*\n\n{lines}",
+            f"👥 *Authorized Users* \\({len(authorized)}\\):\n\n" + "\n".join(lines),
             parse_mode=ParseMode.MARKDOWN_V2,
         )
     else:
         await u.message.reply_text("👥 *No authorized users yet\\.*", parse_mode=ParseMode.MARKDOWN_V2)
+
+
+async def cmd_users(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = u.effective_user.id
+    if not is_admin(uid):
+        await deny(u, ctx)
+        return
+    await _user_list(u)
+
+
+async def cmd_user(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Admin panel: `/user` (list), `/user add <chat_id> [name]`, `/user remove <chat_id>`."""
+    uid = u.effective_user.id
+    if not is_admin(uid):
+        await deny(u, ctx)
+        return
+    args = ctx.args
+    action = args[0].lower() if args else "list"
+
+    if action in ("list", "ls", "show"):
+        await _user_list(u)
+        return
+
+    if action in ("add", "a", "+"):
+        if len(args) < 2 or not args[1].strip().lstrip("-").isdigit():
+            await u.message.reply_text(
+                "Usage: `/user add <chat_id> [name]`", parse_mode=ParseMode.MARKDOWN_V2
+            )
+            return
+        target = int(args[1].strip())
+        name = " ".join(args[2:]).strip()
+        if not name:
+            name = await fetch_user_name(ctx, target)
+        authorize(target, name)
+        shown = esc(name) if name else f"`{target}`"
+        await u.message.reply_text(
+            f"➕ Added {shown} \\(`{target}`\\)\\.", parse_mode=ParseMode.MARKDOWN_V2
+        )
+        try:
+            await ctx.bot.send_message(
+                target,
+                "✅ *Access granted\\!* You can now use the bot\\. Send a message to start\\.",
+            )
+        except Exception:
+            pass
+        return
+
+    if action in ("remove", "rm", "del", "delete", "-"):
+        if len(args) < 2 or not args[1].strip().lstrip("-").isdigit():
+            await u.message.reply_text(
+                "Usage: `/user remove <chat_id>`", parse_mode=ParseMode.MARKDOWN_V2
+            )
+            return
+        target = int(args[1].strip())
+        revoke(target)
+        await u.message.reply_text(
+            f"➖ Removed `{target}`\\.", parse_mode=ParseMode.MARKDOWN_V2
+        )
+        try:
+            await ctx.bot.send_message(target, "🔒 *Access revoked*\\.. Ask the admin again\\.")
+        except Exception:
+            pass
+        return
+
+    await u.message.reply_text(
+        "Usage:\n"
+        "  /user \\- list users\n"
+        "  `/user add <chat\\_id> [name]` \\- add user\n"
+        "  `/user remove <chat\\_id>` \\- remove user",
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
 
 
 async def handle_msg(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -944,18 +1201,9 @@ async def handle_msg(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = msg.from_user.id
     cid = msg.chat.id
 
-    # ── Access gate: admin allowed, others need password ──
+    # ── Access gate: unauthorized users must be approved by the admin ──
     if not is_authorized(uid):
-        guess = (msg.text or "").strip()
-        if guess and guess == BOT_PASSWORD:
-            authorize(uid)
-            await msg.reply_text(
-                "✅ *Access granted\\!*\n"
-                "You can now use the bot\\. Send a message to start\\.",
-                parse_mode=ParseMode.MARKDOWN_V2,
-            )
-            return
-        await deny(u)
+        await deny(u, ctx)
         return
 
     # Prevent concurrent requests per user
@@ -1170,12 +1418,14 @@ async def on_error(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def post_init(app: Application):
     await app.bot.set_my_commands([
         BotCommand("start", "Start bot"),
-        BotCommand("login", "Unlock bot with password"),
+        BotCommand("approve", "Approve access (admin)"),
+        BotCommand("deny", "Deny access (admin)"),
         BotCommand("task", "Manage your tasks"),
         BotCommand("new", "New conversation"),
         BotCommand("status", "Session info"),
         BotCommand("help", "Help"),
         BotCommand("users", "List authorized users (admin)"),
+        BotCommand("user", "User panel: add / remove / list (admin)"),
         BotCommand("revoke", "Revoke access (admin)"),
     ])
 
@@ -1194,13 +1444,16 @@ def build_app():
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("chatid", cmd_chatid))
-    app.add_handler(CommandHandler("login", cmd_login))
+    app.add_handler(CommandHandler("approve", cmd_approve))
+    app.add_handler(CommandHandler("deny", cmd_deny))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("new", cmd_new))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("task", cmd_task))
     app.add_handler(CommandHandler("users", cmd_users))
+    app.add_handler(CommandHandler("user", cmd_user))
     app.add_handler(CommandHandler("revoke", cmd_revoke))
+    app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_msg))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_msg))
     app.add_handler(MessageHandler(filters.PHOTO, handle_msg))
@@ -1234,6 +1487,7 @@ def main():
     load_sessions()
     load_auth()
     load_tasks()
+    load_admin_chat()  # create adminchatid.txt on first run
 
     while True:
         try:
