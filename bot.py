@@ -6,13 +6,20 @@ Rich Telegram formatting, fast replies, full media support.
 
 import asyncio
 import base64
-import fcntl
 import json
 import logging
 import os
 import random
 import re
+import signal
 import ssl
+
+# POSIX-only; used for the single-instance file lock. Absent on Windows dev
+# boxes (where the tests still need to import this module), so degrade gracefully.
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 import tempfile
 import time
 from pathlib import Path
@@ -25,6 +32,8 @@ try:
     ssl._create_default_https_context = lambda: ssl.create_default_context(cafile=certifi.where())
 except ImportError:
     pass
+
+import httpx
 
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -70,6 +79,9 @@ INSECURE_SSL = os.environ.get("INSECURE_SSL", "1") == "1"
 # network blocks api.telegram.org (e.g. https://your-worker.workers.dev).
 BASE_URL = os.environ.get("BOT_API_BASE_URL", "")
 OPENCODE_DIR = os.environ.get("OPENCODE_DIR", os.path.expanduser("~"))
+# Optional: pin the opencode model used for text replies, e.g. "xai/grok-3"
+# (Grok) or "xai/grok-beta". When empty, opencode uses its default model.
+OC_MODEL = os.environ.get("OPENCODE_MODEL", "").strip()
 SESSION_FILE = Path(__file__).parent / "sessions.json"
 AUTH_FILE = Path(__file__).parent / "users.json"   # legacy store (migrated once)
 CHATID_FILE = Path(__file__).parent / "userchatid.txt"   # authorized user chat IDs
@@ -77,7 +89,6 @@ ADMIN_CHAT_FILE = Path(__file__).parent / "adminchatid.txt"  # admin chat ID
 LOCK_FILE = Path(__file__).parent / "bot.lock"
 PID_FILE = Path(__file__).parent / "bot.pid"
 MAX_MSG = 4000
-OPCODE_TIMEOUT = 90
 MEDIA_DIR = Path(tempfile.mkdtemp(prefix="tgbot_media_"))
 
 # ── Access Control ────────────────────────────────────────────────────────────
@@ -94,6 +105,56 @@ STATUS_WORDS = [
 # ── Task Management ───────────────────────────────────────────────────────────
 TASK_FILE = Path(__file__).parent / "tasks.json"
 
+
+# ── Speech-to-Text ────────────────────────────────────────────────────────────
+# opencode has no audio support, so voice notes / audio / video are transcribed
+# to text HERE and only the text is handed to opencode. Any Whisper-compatible
+# endpoint works; the default is Groq (fast, accepts Telegram's .ogg directly).
+def _env_num(name, default, cast=int):
+    """Read a numeric env var, falling back to `default` on junk input."""
+    try:
+        return cast(os.environ.get(name, "").strip() or default)
+    except (TypeError, ValueError):
+        return default
+
+
+# ── OpenCode runtime ──────────────────────────────────────────────────────────
+# opencode cold-starts a full agent on every message; on Termux that can take a
+# while. The old hard 90s cutoff was too aggressive and produced frequent
+# "timed out" replies (and it threw away answers that were seconds from arriving),
+# so the default is higher and tunable via .env.
+OPCODE_TIMEOUT = _env_num("OPCODE_TIMEOUT", 180)
+# How many opencode runs may execute at once. 1 is safest on low-RAM Termux
+# devices (parallel cold agents get slow/crashy); bump it only on a beefier host.
+OC_CONCURRENCY = max(1, _env_num("OPENCODE_CONCURRENCY", 1))
+
+STT_API_KEY = os.environ.get("STT_API_KEY", "").strip()
+STT_URL = os.environ.get(
+    "STT_URL", "https://api.groq.com/openai/v1/audio/transcriptions"
+).strip()
+STT_MODEL = os.environ.get("STT_MODEL", "whisper-large-v3").strip()
+# Empty = auto-detect, which is what makes every language (and code-mixed
+# speech like Thanglish) work. Pin it only to force one language.
+STT_LANG = os.environ.get("STT_LANG", "").strip()
+# Optional vocabulary/style hint passed to Whisper, e.g.
+#   STT_PROMPT="Code-mixed Tamil and English (Thanglish) talk about programming."
+STT_PROMPT = os.environ.get("STT_PROMPT", "").strip()
+STT_TIMEOUT = _env_num("STT_TIMEOUT", 60)
+STT_MAX_MB = _env_num("STT_MAX_MB", 24, float)  # Groq caps uploads at 25 MB
+STT_ECHO = os.environ.get("STT_ECHO", "1") == "1"  # show what the bot heard
+
+# Extensions the Whisper endpoints accept, and how to guess one per MIME type.
+STT_FORMATS = {".flac", ".m4a", ".mp3", ".mp4", ".mpeg", ".mpga",
+               ".oga", ".ogg", ".opus", ".wav", ".webm"}
+STT_EXT_BY_MIME = {
+    "audio/mpeg": ".mp3", "audio/mp3": ".mp3", "audio/mp4": ".m4a",
+    "audio/m4a": ".m4a", "audio/x-m4a": ".m4a", "audio/aac": ".m4a",
+    "audio/ogg": ".ogg", "audio/opus": ".ogg", "audio/vorbis": ".ogg",
+    "audio/wav": ".wav", "audio/x-wav": ".wav", "audio/wave": ".wav",
+    "audio/webm": ".webm", "audio/flac": ".flac", "audio/x-flac": ".flac",
+    "video/mp4": ".mp4", "video/quicktime": ".mp4", "video/webm": ".webm",
+}
+
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 log = logging.getLogger("bot")
 
@@ -103,7 +164,7 @@ class TokenScrubFilter(logging.Filter):
 
     def __init__(self):
         super().__init__()
-        self._secrets = tuple(s for s in (BOT_TOKEN,) if s)
+        self._secrets = tuple(s for s in (BOT_TOKEN, STT_API_KEY) if s)
 
     def filter(self, record):
         try:
@@ -117,7 +178,13 @@ class TokenScrubFilter(logging.Filter):
         return True
 
 
-logging.getLogger().addFilter(TokenScrubFilter())
+# A filter on a logger only sees records logged directly to that logger —
+# records from child loggers ("bot", "httpx", ...) propagate straight to the
+# root HANDLERS without passing the root logger's filters. Attach to the
+# handlers instead, or nothing here is actually redacted.
+_scrub = TokenScrubFilter()
+for _h in logging.getLogger().handlers:
+    _h.addFilter(_scrub)
 # python-telegram-bot / httpx log full request URLs (which contain the token).
 # Keep those quiet on top of the redaction filter.
 for _name in ("httpx", "httpcore", "telegram", "urllib3"):
@@ -201,7 +268,7 @@ def store_obj(path: Path, obj) -> bool:
 lock = asyncio.Lock()
 sessions: dict[int, dict] = {}
 tasks: dict[int, asyncio.Task] = {}
-sem = asyncio.Semaphore(1)  # 1 concurrent opencode run — avoids slow/crashy parallel runs
+sem = asyncio.Semaphore(OC_CONCURRENCY)  # concurrent opencode runs (OPENCODE_CONCURRENCY, default 1)
 
 
 def load_sessions():
@@ -475,11 +542,16 @@ def acquire_singleton():
     except Exception as e:
         log.error(f"Could not open lock file: {e}")
         return None
-    try:
-        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        fh.close()
-        return None
+    if fcntl is None:
+        # No flock available (e.g. Windows dev box). Skip the guarantee — the
+        # single-instance protection only matters on the Termux/Linux host.
+        log.warning("fcntl unavailable; single-instance lock disabled on this platform")
+    else:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            fh.close()
+            return None
     # We hold the lock — record our PID so tools/scripts can show it.
     fh.seek(0)
     fh.truncate()
@@ -492,12 +564,104 @@ def acquire_singleton():
     return fh
 
 
+# ── Speech-to-Text ────────────────────────────────────────────────────────────
+def audio_ext(obj, default=".mp3") -> str:
+    """Pick a file extension the speech endpoint understands.
+
+    Telegram gives us `file_name` and/or `mime_type`; Whisper decides how to
+    decode from the extension, so an .mp3 named blob that is really .m4a fails.
+    """
+    name = getattr(obj, "file_name", None) or ""
+    ext = os.path.splitext(name)[1].lower()
+    if ext in STT_FORMATS:
+        return ext
+    mime = (getattr(obj, "mime_type", None) or "").lower().split(";")[0].strip()
+    return STT_EXT_BY_MIME.get(mime, default)
+
+
+async def transcribe(path) -> tuple[str, str]:
+    """Turn one audio/video file into text. Returns (transcript, error_reason).
+
+    opencode cannot read audio at all, so this runs first and only the text is
+    forwarded. `STT_LANG` is empty by default => the model auto-detects, which
+    is what lets any language (including code-mixed speech) come through.
+    """
+    if not path or not os.path.exists(path):
+        return "", "the audio could not be downloaded"
+    if not STT_API_KEY:
+        return "", "speech-to-text is not set up yet (set STT_API_KEY)"
+
+    size = os.path.getsize(path)
+    if size == 0:
+        return "", "the audio file is empty"
+    if size > STT_MAX_MB * 1024 * 1024:
+        return "", f"the audio is too big ({size / 1048576:.1f} MB, limit {STT_MAX_MB:g} MB)"
+
+    form = {"model": STT_MODEL, "response_format": "verbose_json"}
+    if STT_LANG:
+        form["language"] = STT_LANG
+    if STT_PROMPT:
+        form["prompt"] = STT_PROMPT
+
+    try:
+        with open(path, "rb") as fh:
+            blob = fh.read()
+        async with httpx.AsyncClient(timeout=STT_TIMEOUT, verify=not INSECURE_SSL) as c:
+            r = await c.post(
+                STT_URL,
+                headers={"Authorization": f"Bearer {STT_API_KEY}"},
+                files={"file": (os.path.basename(path), blob, "application/octet-stream")},
+                data=form,
+            )
+        if r.status_code != 200:
+            log.error(f"STT HTTP {r.status_code}: {r.text[:200]}")
+            if r.status_code in (401, 403):
+                return "", "the speech service rejected the API key"
+            if r.status_code == 429:
+                return "", "the speech service is rate limited — try again in a moment"
+            return "", f"the speech service returned HTTP {r.status_code}"
+        body = r.json()
+    except Exception as e:
+        log.error(f"STT failed: {type(e).__name__}: {e}")
+        return "", "the speech service could not be reached"
+
+    txt = (body.get("text") or "").strip() if isinstance(body, dict) else ""
+    if not txt:
+        return "", "no speech was detected in that audio"
+    lang = (body.get("language") or "").strip() or "auto"
+    log.info(f"STT ok: {len(txt)} chars, lang={lang}")
+    return txt, ""
+
+
 # ── OpenCode ──────────────────────────────────────────────────────────────────
 # NOTE: --attach (warm server) does NOT return text in opencode 1.18.22,
 # so we always run cold (reliable output).
 
+def _kill_tree(p):
+    """Kill an opencode run *and every child it spawned* (Node workers, etc.).
+
+    A plain p.kill() only signals the direct child; the node subprocesses it
+    started keep running, hog CPU/RAM on a small Termux device and slow the very
+    next reply. Because we launch opencode with start_new_session=True it leads
+    its own process group, so on POSIX we signal the whole group in one shot."""
+    if p is None or p.returncode is not None:
+        return
+    try:
+        if hasattr(os, "killpg"):
+            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+        else:
+            p.kill()
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            p.kill()
+        except Exception:
+            pass
+
+
 async def run_oc(msg, uid, sid="", files=None, title=""):
     cmd = ["opencode", "run", "--format", "json", "--auto"]
+    if OC_MODEL:
+        cmd += ["--model", OC_MODEL]
     if sid:
         cmd += ["--session", sid]
     elif title:
@@ -508,23 +672,35 @@ async def run_oc(msg, uid, sid="", files=None, title=""):
     cmd.append(msg)
 
     log.info(f"[{uid}] opencode run (sid={sid[:12] if sid else 'new'})...")
+    p = None
     try:
         p = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE, cwd=OPENCODE_DIR,
+            start_new_session=True,  # own process group, so a timeout kills the whole tree
         )
         out, _ = await asyncio.wait_for(p.communicate(), timeout=OPCODE_TIMEOUT)
         resp, sid_out = parse_json(out.decode("utf-8", errors="replace"), sid)
         log.info(f"[{uid}] opencode done ({len(out)} bytes out, {len(resp)} chars text)")
         return resp, sid_out
     except asyncio.TimeoutError:
+        _kill_tree(p)
+        # Salvage anything opencode already streamed before we gave up — a slow
+        # run is often only seconds from done, and showing that answer beats a
+        # bare "timed out". Best effort: the process is dead, so this drains fast.
+        salvaged = b""
         try:
-            p.kill()
+            salvaged, _ = await asyncio.wait_for(p.communicate(), timeout=5)
         except Exception:
             pass
-        log.error(f"[{uid}] opencode timed out after {OPCODE_TIMEOUT}s")
-        return "Timed out. Try a shorter message.", ""
+        resp, sid_out = parse_json(salvaged.decode("utf-8", errors="replace"), sid)
+        if resp and resp != "_No response._":
+            log.warning(f"[{uid}] opencode hit {OPCODE_TIMEOUT}s; salvaged {len(resp)} chars")
+            return resp, sid_out
+        log.error(f"[{uid}] opencode timed out after {OPCODE_TIMEOUT}s (no text)")
+        return "That took too long. Try again, or send a shorter message.", ""
     except Exception as e:
+        _kill_tree(p)
         log.error(f"[{uid}] opencode error: {e}")
         return f"Error: {e}", ""
 
@@ -1211,27 +1387,72 @@ async def handle_msg(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("⏳ Wait for previous answer\\.\\.\\.", parse_mode=ParseMode.MARKDOWN_V2)
         return
 
+    # Show we picked the message up before the (possibly slow) downloads
+    await ctx.bot.send_chat_action(chat_id=cid, action=ChatAction.TYPING)
+
     # Extract content
     text = msg.text or msg.caption or ""
-    files = []
+    files = []        # handed to opencode as --file
+    audio = []        # transcribed here instead — opencode cannot read audio
 
     if msg.document:
         files.append(await dl(ctx.bot, msg.document, f"doc_{msg.message_id}"))
     if msg.photo:
-        p = max(msg.photo, key=lambda x: x.file_size)
+        # file_size is optional on PhotoSize; `or 0` keeps max() from crashing
+        p = max(msg.photo, key=lambda x: x.file_size or 0)
         files.append(await dl(ctx.bot, p, f"photo_{msg.message_id}.jpg"))
     if msg.audio:
-        files.append(await dl(ctx.bot, msg.audio, f"audio_{msg.message_id}.mp3"))
+        aext = audio_ext(msg.audio, ".mp3")
+        audio.append(await dl(ctx.bot, msg.audio, f"audio_{msg.message_id}{aext}"))
     if msg.voice:
-        files.append(await dl(ctx.bot, msg.voice, f"voice_{msg.message_id}.ogg"))
+        audio.append(await dl(ctx.bot, msg.voice, f"voice_{msg.message_id}.ogg"))
     if msg.video:
-        files.append(await dl(ctx.bot, msg.video, f"video_{msg.message_id}.mp4"))
+        audio.append(await dl(ctx.bot, msg.video, f"video_{msg.message_id}.mp4"))
     if msg.video_note:
-        files.append(await dl(ctx.bot, msg.video_note, f"vn_{msg.message_id}.mp4"))
+        audio.append(await dl(ctx.bot, msg.video_note, f"vn_{msg.message_id}.mp4"))
     if msg.sticker:
         ext = "webm" if msg.sticker.is_video else "webp"
         if not msg.sticker.is_animated:
             files.append(await dl(ctx.bot, msg.sticker, f"stk_{msg.message_id}.{ext}"))
+
+    # ── Voice / audio / video → text ──
+    # The language is auto-detected, so speak any language — or mix two.
+    if audio:
+        heard, why = [], ""
+        for a in audio:
+            one, err = await transcribe(a)
+            if one:
+                heard.append(one)
+            elif err:
+                why = err
+        for a in audio:                       # the audio itself is never kept
+            try:
+                if a and os.path.exists(a):
+                    os.remove(a)
+            except Exception:
+                pass
+
+        spoken = "\n".join(heard).strip()
+        if spoken:
+            text = f"{text}\n\n{spoken}".strip() if text else spoken
+            if STT_ECHO:
+                preview = spoken if len(spoken) <= 700 else spoken[:700] + "…"
+                try:
+                    await msg.reply_text(
+                        f"🎤 _{esc(preview)}_", parse_mode=ParseMode.MARKDOWN_V2
+                    )
+                except Exception:
+                    pass
+        else:
+            try:
+                await msg.reply_text(
+                    f"🎤 Couldn't turn that into text — {esc(why or 'unknown error')}\\.",
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                )
+            except Exception:
+                pass
+            if not text and not files:
+                return
 
     if not text and not files:
         await msg.reply_text("🤔 Send a message or file\\.", parse_mode=ParseMode.MARKDOWN_V2)
