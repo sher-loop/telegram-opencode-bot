@@ -7,6 +7,8 @@ Run with:
 
 import logging
 
+import pytest
+
 import bot
 
 
@@ -189,6 +191,10 @@ def test_split_msg_chunks():
 
 
 # ── Single instance lock ─────────────────────────────────────────────────────
+@pytest.mark.skipif(
+    bot.fcntl is None,
+    reason="single-instance lock needs fcntl (POSIX only); guarantee holds on the Termux host",
+)
 def test_singleton_lock_excludes_second(tmp_path, monkeypatch):
     # Isolate: a live bot may already hold bot.lock
     monkeypatch.setattr(bot, "LOCK_FILE", tmp_path / "bot.lock")

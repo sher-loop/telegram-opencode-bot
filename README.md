@@ -96,8 +96,10 @@ Other optional variables:
 | `BOT_TOKEN` | *(required)* | Telegram bot token |
 | `BOT_SECRET_KEY` | auto-generated | Key used to obfuscate stored data |
 | `ADMIN_IDS` | `8937986952` | Comma-separated admin user IDs |
-| `OPENCODE_DIR` | `$HOME` | Working directory for opencode |
+| `OPENCODE_DIR` | `$HOME` | Working directory for opencode (point at a small/empty dir for speed) |
 | `OPENCODE_MODEL` | *(empty = opencode default)* | Pin the chat model for answers, e.g. `xai/grok-3` (Grok) |
+| `OPCODE_TIMEOUT` | `180` | Seconds to wait for one opencode run before giving up. Raise it if you still see "That took too long"; a slow-but-finished answer is now salvaged instead of discarded |
+| `OPENCODE_CONCURRENCY` | `1` | How many opencode runs may execute at once. Keep at 1 on low-RAM Termux devices |
 | `INSECURE_SSL` | `1` | Bypass SSL verification (MITM networks) |
 | `BOT_API_BASE_URL` | *(empty)* | Optional proxy/tunnel base URL |
 | `STT_API_KEY` | *(empty)* | Speech-to-text key — **without it, voice messages don't work** |
@@ -166,6 +168,27 @@ to keep opencode's default model. Sanity-check a key directly with:
 ```bash
 opencode run --model xai/grok-3 --format json --auto "ping"
 ```
+
+### Make Replies Faster
+
+Every message cold-starts a full opencode agent, so reply speed is dominated by
+**which model answers** and **how much opencode has to do**. Biggest wins first:
+
+1. **Pin a fast model.** This is the single biggest lever. Fast options:
+   - `OPENCODE_MODEL="xai/grok-3-mini"` (Grok, small = faster than `grok-3`)
+   - a Groq-hosted model (you likely already have a Groq key for voice), e.g.
+     `OPENCODE_MODEL="groq/llama-3.3-70b-versatile"`
+   Then restart. Verify a key with:
+   `opencode run --model <id> --format json --auto "ping"`
+2. **Point `OPENCODE_DIR` at a small, empty folder** (e.g. `~/botwork`). The
+   default `$HOME` is large, so the agent can waste time scanning files it will
+   never need:
+   ```bash
+   mkdir -p ~/botwork
+   echo 'OPENCODE_DIR="/data/data/com.termux/files/home/botwork"' >> ~/telegram-opencode-bot/.env
+   ```
+3. **If you still hit "That took too long"**, raise `OPCODE_TIMEOUT` (a run that
+   finishes late now still gets sent — its answer is salvaged, not thrown away).
 
 ### 6. Run the Bot
 
@@ -286,6 +309,14 @@ The bot converts AI responses to rich Telegram style:
 **"the speech service rejected the API key" / "returned HTTP 4xx":**
 - Check the key at [console.groq.com](https://console.groq.com/keys); look in
   `bot.log` for the exact response body.
+
+**Replies are slow or say "That took too long":**
+- Reply speed is set mostly by the model. Pin a fast one with `OPENCODE_MODEL`
+  and point `OPENCODE_DIR` at a small folder — see *Make Replies Faster* above.
+- A run that finishes just after the cutoff now still sends its answer (it is
+  salvaged), so raising `OPCODE_TIMEOUT` is safe if a few replies still time out.
+- On a timeout the bot now kills opencode **and every process it spawned**, so a
+  stuck run can't keep hogging CPU and slowing the next reply.
 
 **opencode errors:**
 - Make sure opencode is installed: `opencode --version`

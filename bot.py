@@ -6,13 +6,20 @@ Rich Telegram formatting, fast replies, full media support.
 
 import asyncio
 import base64
-import fcntl
 import json
 import logging
 import os
 import random
 import re
+import signal
 import ssl
+
+# POSIX-only; used for the single-instance file lock. Absent on Windows dev
+# boxes (where the tests still need to import this module), so degrade gracefully.
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 import tempfile
 import time
 from pathlib import Path
@@ -82,7 +89,6 @@ ADMIN_CHAT_FILE = Path(__file__).parent / "adminchatid.txt"  # admin chat ID
 LOCK_FILE = Path(__file__).parent / "bot.lock"
 PID_FILE = Path(__file__).parent / "bot.pid"
 MAX_MSG = 4000
-OPCODE_TIMEOUT = 90
 MEDIA_DIR = Path(tempfile.mkdtemp(prefix="tgbot_media_"))
 
 # ── Access Control ────────────────────────────────────────────────────────────
@@ -111,6 +117,16 @@ def _env_num(name, default, cast=int):
     except (TypeError, ValueError):
         return default
 
+
+# ── OpenCode runtime ──────────────────────────────────────────────────────────
+# opencode cold-starts a full agent on every message; on Termux that can take a
+# while. The old hard 90s cutoff was too aggressive and produced frequent
+# "timed out" replies (and it threw away answers that were seconds from arriving),
+# so the default is higher and tunable via .env.
+OPCODE_TIMEOUT = _env_num("OPCODE_TIMEOUT", 180)
+# How many opencode runs may execute at once. 1 is safest on low-RAM Termux
+# devices (parallel cold agents get slow/crashy); bump it only on a beefier host.
+OC_CONCURRENCY = max(1, _env_num("OPENCODE_CONCURRENCY", 1))
 
 STT_API_KEY = os.environ.get("STT_API_KEY", "").strip()
 STT_URL = os.environ.get(
@@ -252,7 +268,7 @@ def store_obj(path: Path, obj) -> bool:
 lock = asyncio.Lock()
 sessions: dict[int, dict] = {}
 tasks: dict[int, asyncio.Task] = {}
-sem = asyncio.Semaphore(1)  # 1 concurrent opencode run — avoids slow/crashy parallel runs
+sem = asyncio.Semaphore(OC_CONCURRENCY)  # concurrent opencode runs (OPENCODE_CONCURRENCY, default 1)
 
 
 def load_sessions():
@@ -526,11 +542,16 @@ def acquire_singleton():
     except Exception as e:
         log.error(f"Could not open lock file: {e}")
         return None
-    try:
-        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        fh.close()
-        return None
+    if fcntl is None:
+        # No flock available (e.g. Windows dev box). Skip the guarantee — the
+        # single-instance protection only matters on the Termux/Linux host.
+        log.warning("fcntl unavailable; single-instance lock disabled on this platform")
+    else:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            fh.close()
+            return None
     # We hold the lock — record our PID so tools/scripts can show it.
     fh.seek(0)
     fh.truncate()
@@ -616,6 +637,27 @@ async def transcribe(path) -> tuple[str, str]:
 # NOTE: --attach (warm server) does NOT return text in opencode 1.18.22,
 # so we always run cold (reliable output).
 
+def _kill_tree(p):
+    """Kill an opencode run *and every child it spawned* (Node workers, etc.).
+
+    A plain p.kill() only signals the direct child; the node subprocesses it
+    started keep running, hog CPU/RAM on a small Termux device and slow the very
+    next reply. Because we launch opencode with start_new_session=True it leads
+    its own process group, so on POSIX we signal the whole group in one shot."""
+    if p is None or p.returncode is not None:
+        return
+    try:
+        if hasattr(os, "killpg"):
+            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+        else:
+            p.kill()
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            p.kill()
+        except Exception:
+            pass
+
+
 async def run_oc(msg, uid, sid="", files=None, title=""):
     cmd = ["opencode", "run", "--format", "json", "--auto"]
     if OC_MODEL:
@@ -630,23 +672,35 @@ async def run_oc(msg, uid, sid="", files=None, title=""):
     cmd.append(msg)
 
     log.info(f"[{uid}] opencode run (sid={sid[:12] if sid else 'new'})...")
+    p = None
     try:
         p = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE, cwd=OPENCODE_DIR,
+            start_new_session=True,  # own process group, so a timeout kills the whole tree
         )
         out, _ = await asyncio.wait_for(p.communicate(), timeout=OPCODE_TIMEOUT)
         resp, sid_out = parse_json(out.decode("utf-8", errors="replace"), sid)
         log.info(f"[{uid}] opencode done ({len(out)} bytes out, {len(resp)} chars text)")
         return resp, sid_out
     except asyncio.TimeoutError:
+        _kill_tree(p)
+        # Salvage anything opencode already streamed before we gave up — a slow
+        # run is often only seconds from done, and showing that answer beats a
+        # bare "timed out". Best effort: the process is dead, so this drains fast.
+        salvaged = b""
         try:
-            p.kill()
+            salvaged, _ = await asyncio.wait_for(p.communicate(), timeout=5)
         except Exception:
             pass
-        log.error(f"[{uid}] opencode timed out after {OPCODE_TIMEOUT}s")
-        return "Timed out. Try a shorter message.", ""
+        resp, sid_out = parse_json(salvaged.decode("utf-8", errors="replace"), sid)
+        if resp and resp != "_No response._":
+            log.warning(f"[{uid}] opencode hit {OPCODE_TIMEOUT}s; salvaged {len(resp)} chars")
+            return resp, sid_out
+        log.error(f"[{uid}] opencode timed out after {OPCODE_TIMEOUT}s (no text)")
+        return "That took too long. Try again, or send a shorter message.", ""
     except Exception as e:
+        _kill_tree(p)
         log.error(f"[{uid}] opencode error: {e}")
         return f"Error: {e}", ""
 
