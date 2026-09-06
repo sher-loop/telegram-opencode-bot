@@ -72,6 +72,9 @@ INSECURE_SSL = os.environ.get("INSECURE_SSL", "1") == "1"
 # network blocks api.telegram.org (e.g. https://your-worker.workers.dev).
 BASE_URL = os.environ.get("BOT_API_BASE_URL", "")
 OPENCODE_DIR = os.environ.get("OPENCODE_DIR", os.path.expanduser("~"))
+# Optional: pin the opencode model used for text replies, e.g. "xai/grok-3"
+# (Grok) or "xai/grok-beta". When empty, opencode uses its default model.
+OC_MODEL = os.environ.get("OPENCODE_MODEL", "").strip()
 SESSION_FILE = Path(__file__).parent / "sessions.json"
 AUTH_FILE = Path(__file__).parent / "users.json"   # legacy store (migrated once)
 CHATID_FILE = Path(__file__).parent / "userchatid.txt"   # authorized user chat IDs
@@ -615,6 +618,8 @@ async def transcribe(path) -> tuple[str, str]:
 
 async def run_oc(msg, uid, sid="", files=None, title=""):
     cmd = ["opencode", "run", "--format", "json", "--auto"]
+    if OC_MODEL:
+        cmd += ["--model", OC_MODEL]
     if sid:
         cmd += ["--session", sid]
     elif title:

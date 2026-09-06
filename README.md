@@ -97,6 +97,7 @@ Other optional variables:
 | `BOT_SECRET_KEY` | auto-generated | Key used to obfuscate stored data |
 | `ADMIN_IDS` | `8937986952` | Comma-separated admin user IDs |
 | `OPENCODE_DIR` | `$HOME` | Working directory for opencode |
+| `OPENCODE_MODEL` | *(empty = opencode default)* | Pin the chat model for answers, e.g. `xai/grok-3` (Grok) |
 | `INSECURE_SSL` | `1` | Bypass SSL verification (MITM networks) |
 | `BOT_API_BASE_URL` | *(empty)* | Optional proxy/tunnel base URL |
 | `STT_API_KEY` | *(empty)* | Speech-to-text key — **without it, voice messages don't work** |
@@ -144,7 +145,29 @@ Or pin a single language with `STT_LANG="ta"` if you only ever speak one.
 > If that is not acceptable, point `STT_URL` at a local Whisper server instead —
 > the bot only needs an OpenAI-compatible `/audio/transcriptions` endpoint.
 
-### 5. Run the Bot
+### 5. Use Grok as the Chat Model (optional)
+
+Text answers go through `opencode`. To make the bot use **Grok (xAI)** instead of
+opencode's default model:
+
+```bash
+# 1. Add your xAI key to opencode
+opencode auth login          # select "xAI" → "Manually enter API Key"
+# 2. Pin the model for the bot
+echo 'OPENCODE_MODEL="xai/grok-3"' >> ~/telegram-opencode-bot/.env
+# 3. Restart
+cd ~/telegram-opencode-bot && bash run_bg.sh stop && bash run_bg.sh start
+```
+
+Get the key at [console.x.ai](https://console.x.ai/). Any Grok id works, e.g.
+`xai/grok-3`, `xai/grok-3-mini`, `xai/grok-beta`. Leave `OPENCODE_MODEL` empty
+to keep opencode's default model. Sanity-check a key directly with:
+
+```bash
+opencode run --model xai/grok-3 --format json --auto "ping"
+```
+
+### 6. Run the Bot
 
 **Foreground (test mode):**
 ```bash
