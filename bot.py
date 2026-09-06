@@ -26,6 +26,8 @@ try:
 except ImportError:
     pass
 
+import httpx
+
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
@@ -94,6 +96,46 @@ STATUS_WORDS = [
 # ── Task Management ───────────────────────────────────────────────────────────
 TASK_FILE = Path(__file__).parent / "tasks.json"
 
+
+# ── Speech-to-Text ────────────────────────────────────────────────────────────
+# opencode has no audio support, so voice notes / audio / video are transcribed
+# to text HERE and only the text is handed to opencode. Any Whisper-compatible
+# endpoint works; the default is Groq (fast, accepts Telegram's .ogg directly).
+def _env_num(name, default, cast=int):
+    """Read a numeric env var, falling back to `default` on junk input."""
+    try:
+        return cast(os.environ.get(name, "").strip() or default)
+    except (TypeError, ValueError):
+        return default
+
+
+STT_API_KEY = os.environ.get("STT_API_KEY", "").strip()
+STT_URL = os.environ.get(
+    "STT_URL", "https://api.groq.com/openai/v1/audio/transcriptions"
+).strip()
+STT_MODEL = os.environ.get("STT_MODEL", "whisper-large-v3").strip()
+# Empty = auto-detect, which is what makes every language (and code-mixed
+# speech like Thanglish) work. Pin it only to force one language.
+STT_LANG = os.environ.get("STT_LANG", "").strip()
+# Optional vocabulary/style hint passed to Whisper, e.g.
+#   STT_PROMPT="Code-mixed Tamil and English (Thanglish) talk about programming."
+STT_PROMPT = os.environ.get("STT_PROMPT", "").strip()
+STT_TIMEOUT = _env_num("STT_TIMEOUT", 60)
+STT_MAX_MB = _env_num("STT_MAX_MB", 24, float)  # Groq caps uploads at 25 MB
+STT_ECHO = os.environ.get("STT_ECHO", "1") == "1"  # show what the bot heard
+
+# Extensions the Whisper endpoints accept, and how to guess one per MIME type.
+STT_FORMATS = {".flac", ".m4a", ".mp3", ".mp4", ".mpeg", ".mpga",
+               ".oga", ".ogg", ".opus", ".wav", ".webm"}
+STT_EXT_BY_MIME = {
+    "audio/mpeg": ".mp3", "audio/mp3": ".mp3", "audio/mp4": ".m4a",
+    "audio/m4a": ".m4a", "audio/x-m4a": ".m4a", "audio/aac": ".m4a",
+    "audio/ogg": ".ogg", "audio/opus": ".ogg", "audio/vorbis": ".ogg",
+    "audio/wav": ".wav", "audio/x-wav": ".wav", "audio/wave": ".wav",
+    "audio/webm": ".webm", "audio/flac": ".flac", "audio/x-flac": ".flac",
+    "video/mp4": ".mp4", "video/quicktime": ".mp4", "video/webm": ".webm",
+}
+
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 log = logging.getLogger("bot")
 
@@ -103,7 +145,7 @@ class TokenScrubFilter(logging.Filter):
 
     def __init__(self):
         super().__init__()
-        self._secrets = tuple(s for s in (BOT_TOKEN,) if s)
+        self._secrets = tuple(s for s in (BOT_TOKEN, STT_API_KEY) if s)
 
     def filter(self, record):
         try:
@@ -117,7 +159,13 @@ class TokenScrubFilter(logging.Filter):
         return True
 
 
-logging.getLogger().addFilter(TokenScrubFilter())
+# A filter on a logger only sees records logged directly to that logger —
+# records from child loggers ("bot", "httpx", ...) propagate straight to the
+# root HANDLERS without passing the root logger's filters. Attach to the
+# handlers instead, or nothing here is actually redacted.
+_scrub = TokenScrubFilter()
+for _h in logging.getLogger().handlers:
+    _h.addFilter(_scrub)
 # python-telegram-bot / httpx log full request URLs (which contain the token).
 # Keep those quiet on top of the redaction filter.
 for _name in ("httpx", "httpcore", "telegram", "urllib3"):
@@ -490,6 +538,75 @@ def acquire_singleton():
     except Exception:
         pass
     return fh
+
+
+# ── Speech-to-Text ────────────────────────────────────────────────────────────
+def audio_ext(obj, default=".mp3") -> str:
+    """Pick a file extension the speech endpoint understands.
+
+    Telegram gives us `file_name` and/or `mime_type`; Whisper decides how to
+    decode from the extension, so an .mp3 named blob that is really .m4a fails.
+    """
+    name = getattr(obj, "file_name", None) or ""
+    ext = os.path.splitext(name)[1].lower()
+    if ext in STT_FORMATS:
+        return ext
+    mime = (getattr(obj, "mime_type", None) or "").lower().split(";")[0].strip()
+    return STT_EXT_BY_MIME.get(mime, default)
+
+
+async def transcribe(path) -> tuple[str, str]:
+    """Turn one audio/video file into text. Returns (transcript, error_reason).
+
+    opencode cannot read audio at all, so this runs first and only the text is
+    forwarded. `STT_LANG` is empty by default => the model auto-detects, which
+    is what lets any language (including code-mixed speech) come through.
+    """
+    if not path or not os.path.exists(path):
+        return "", "the audio could not be downloaded"
+    if not STT_API_KEY:
+        return "", "speech-to-text is not set up yet (set STT_API_KEY)"
+
+    size = os.path.getsize(path)
+    if size == 0:
+        return "", "the audio file is empty"
+    if size > STT_MAX_MB * 1024 * 1024:
+        return "", f"the audio is too big ({size / 1048576:.1f} MB, limit {STT_MAX_MB:g} MB)"
+
+    form = {"model": STT_MODEL, "response_format": "verbose_json"}
+    if STT_LANG:
+        form["language"] = STT_LANG
+    if STT_PROMPT:
+        form["prompt"] = STT_PROMPT
+
+    try:
+        with open(path, "rb") as fh:
+            blob = fh.read()
+        async with httpx.AsyncClient(timeout=STT_TIMEOUT, verify=not INSECURE_SSL) as c:
+            r = await c.post(
+                STT_URL,
+                headers={"Authorization": f"Bearer {STT_API_KEY}"},
+                files={"file": (os.path.basename(path), blob, "application/octet-stream")},
+                data=form,
+            )
+        if r.status_code != 200:
+            log.error(f"STT HTTP {r.status_code}: {r.text[:200]}")
+            if r.status_code in (401, 403):
+                return "", "the speech service rejected the API key"
+            if r.status_code == 429:
+                return "", "the speech service is rate limited — try again in a moment"
+            return "", f"the speech service returned HTTP {r.status_code}"
+        body = r.json()
+    except Exception as e:
+        log.error(f"STT failed: {type(e).__name__}: {e}")
+        return "", "the speech service could not be reached"
+
+    txt = (body.get("text") or "").strip() if isinstance(body, dict) else ""
+    if not txt:
+        return "", "no speech was detected in that audio"
+    lang = (body.get("language") or "").strip() or "auto"
+    log.info(f"STT ok: {len(txt)} chars, lang={lang}")
+    return txt, ""
 
 
 # ── OpenCode ──────────────────────────────────────────────────────────────────
@@ -1211,27 +1328,72 @@ async def handle_msg(u: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("⏳ Wait for previous answer\\.\\.\\.", parse_mode=ParseMode.MARKDOWN_V2)
         return
 
+    # Show we picked the message up before the (possibly slow) downloads
+    await ctx.bot.send_chat_action(chat_id=cid, action=ChatAction.TYPING)
+
     # Extract content
     text = msg.text or msg.caption or ""
-    files = []
+    files = []        # handed to opencode as --file
+    audio = []        # transcribed here instead — opencode cannot read audio
 
     if msg.document:
         files.append(await dl(ctx.bot, msg.document, f"doc_{msg.message_id}"))
     if msg.photo:
-        p = max(msg.photo, key=lambda x: x.file_size)
+        # file_size is optional on PhotoSize; `or 0` keeps max() from crashing
+        p = max(msg.photo, key=lambda x: x.file_size or 0)
         files.append(await dl(ctx.bot, p, f"photo_{msg.message_id}.jpg"))
     if msg.audio:
-        files.append(await dl(ctx.bot, msg.audio, f"audio_{msg.message_id}.mp3"))
+        aext = audio_ext(msg.audio, ".mp3")
+        audio.append(await dl(ctx.bot, msg.audio, f"audio_{msg.message_id}{aext}"))
     if msg.voice:
-        files.append(await dl(ctx.bot, msg.voice, f"voice_{msg.message_id}.ogg"))
+        audio.append(await dl(ctx.bot, msg.voice, f"voice_{msg.message_id}.ogg"))
     if msg.video:
-        files.append(await dl(ctx.bot, msg.video, f"video_{msg.message_id}.mp4"))
+        audio.append(await dl(ctx.bot, msg.video, f"video_{msg.message_id}.mp4"))
     if msg.video_note:
-        files.append(await dl(ctx.bot, msg.video_note, f"vn_{msg.message_id}.mp4"))
+        audio.append(await dl(ctx.bot, msg.video_note, f"vn_{msg.message_id}.mp4"))
     if msg.sticker:
         ext = "webm" if msg.sticker.is_video else "webp"
         if not msg.sticker.is_animated:
             files.append(await dl(ctx.bot, msg.sticker, f"stk_{msg.message_id}.{ext}"))
+
+    # ── Voice / audio / video → text ──
+    # The language is auto-detected, so speak any language — or mix two.
+    if audio:
+        heard, why = [], ""
+        for a in audio:
+            one, err = await transcribe(a)
+            if one:
+                heard.append(one)
+            elif err:
+                why = err
+        for a in audio:                       # the audio itself is never kept
+            try:
+                if a and os.path.exists(a):
+                    os.remove(a)
+            except Exception:
+                pass
+
+        spoken = "\n".join(heard).strip()
+        if spoken:
+            text = f"{text}\n\n{spoken}".strip() if text else spoken
+            if STT_ECHO:
+                preview = spoken if len(spoken) <= 700 else spoken[:700] + "…"
+                try:
+                    await msg.reply_text(
+                        f"🎤 _{esc(preview)}_", parse_mode=ParseMode.MARKDOWN_V2
+                    )
+                except Exception:
+                    pass
+        else:
+            try:
+                await msg.reply_text(
+                    f"🎤 Couldn't turn that into text — {esc(why or 'unknown error')}\\.",
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                )
+            except Exception:
+                pass
+            if not text and not files:
+                return
 
     if not text and not files:
         await msg.reply_text("🤔 Send a message or file\\.", parse_mode=ParseMode.MARKDOWN_V2)

@@ -5,6 +5,8 @@ Run with:
     python3 -m pytest tests/ -v
 """
 
+import logging
+
 import bot
 
 
@@ -253,3 +255,186 @@ def test_admin_chat_created_from_admin_ids(tmp_path, monkeypatch):
     monkeypatch.setattr(bot, "ADMIN_IDS", [42])
     assert bot.load_admin_chat() == 42
     assert (tmp_path / "adminchatid.txt").read_text().strip() == "42"
+
+
+# ── Speech-to-Text ───────────────────────────────────────────────────────────
+class _Obj:
+    """Stand-in for telegram.Audio / telegram.Voice."""
+
+    def __init__(self, file_name=None, mime_type=None):
+        self.file_name = file_name
+        self.mime_type = mime_type
+
+
+def test_audio_ext_from_file_name():
+    assert bot.audio_ext(_Obj(file_name="song.M4A")) == ".m4a"
+
+
+def test_audio_ext_from_mime_when_name_useless():
+    assert bot.audio_ext(_Obj(file_name="track.bin", mime_type="audio/ogg")) == ".ogg"
+
+
+def test_audio_ext_mime_with_parameters():
+    assert bot.audio_ext(_Obj(mime_type="audio/webm; codecs=opus")) == ".webm"
+
+
+def test_audio_ext_falls_back_to_default():
+    assert bot.audio_ext(_Obj(), default=".mp4") == ".mp4"
+
+
+def _run(coro):
+    import asyncio
+
+    return asyncio.run(coro)
+
+
+def test_transcribe_without_key_is_reported(tmp_path, monkeypatch):
+    f = tmp_path / "voice.ogg"
+    f.write_bytes(b"fake audio")
+    monkeypatch.setattr(bot, "STT_API_KEY", "")
+    txt, err = _run(bot.transcribe(str(f)))
+    assert txt == ""
+    assert "STT_API_KEY" in err
+
+
+def test_transcribe_missing_file(monkeypatch):
+    monkeypatch.setattr(bot, "STT_API_KEY", "k")
+    txt, err = _run(bot.transcribe("/nope/does_not_exist.ogg"))
+    assert txt == ""
+    assert err
+
+
+def test_transcribe_rejects_oversized_audio(tmp_path, monkeypatch):
+    f = tmp_path / "big.ogg"
+    f.write_bytes(b"x" * 2048)
+    monkeypatch.setattr(bot, "STT_API_KEY", "k")
+    monkeypatch.setattr(bot, "STT_MAX_MB", 0.001)  # 1 KB
+    txt, err = _run(bot.transcribe(str(f)))
+    assert txt == ""
+    assert "too big" in err
+
+
+class _FakeResponse:
+    def __init__(self, payload, status=200):
+        self._payload = payload
+        self.status_code = status
+        self.text = "error body"
+
+    def json(self):
+        return self._payload
+
+
+def _fake_httpx(payload, sent, status=200):
+    class _FakeClient:
+        def __init__(self, **kw):
+            sent["client_kwargs"] = kw
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def post(self, url, headers=None, files=None, data=None):
+            sent["url"] = url
+            sent["headers"] = headers
+            sent["files"] = files
+            sent["data"] = data
+            return _FakeResponse(payload, status)
+
+    class _FakeModule:
+        AsyncClient = _FakeClient
+
+    return _FakeModule
+
+
+def test_transcribe_happy_path(tmp_path, monkeypatch):
+    f = tmp_path / "voice.ogg"
+    f.write_bytes(b"fake audio")
+    sent = {}
+    monkeypatch.setattr(bot, "STT_API_KEY", "secret-key")
+    monkeypatch.setattr(bot, "STT_MODEL", "whisper-large-v3")
+    monkeypatch.setattr(bot, "STT_LANG", "")
+    monkeypatch.setattr(bot, "STT_PROMPT", "")
+    monkeypatch.setattr(
+        bot, "httpx", _fake_httpx({"text": " add a login page ", "language": "en"}, sent)
+    )
+    txt, err = _run(bot.transcribe(str(f)))
+    assert txt == "add a login page"
+    assert err == ""
+    assert sent["headers"]["Authorization"] == "Bearer secret-key"
+    assert sent["data"]["model"] == "whisper-large-v3"
+    # Empty STT_LANG must NOT be sent — that is what enables auto-detection
+    assert "language" not in sent["data"]
+
+
+def test_transcribe_keeps_non_ascii_transcript(tmp_path, monkeypatch):
+    f = tmp_path / "voice.ogg"
+    f.write_bytes(b"fake audio")
+    tamil = "வணக்கம் login page add பண்ணு"
+    monkeypatch.setattr(bot, "STT_API_KEY", "k")
+    monkeypatch.setattr(bot, "httpx", _fake_httpx({"text": tamil, "language": "ta"}, {}))
+    txt, err = _run(bot.transcribe(str(f)))
+    assert txt == tamil
+    assert err == ""
+
+
+def test_transcribe_sends_language_and_prompt_when_set(tmp_path, monkeypatch):
+    f = tmp_path / "voice.ogg"
+    f.write_bytes(b"fake audio")
+    sent = {}
+    monkeypatch.setattr(bot, "STT_API_KEY", "k")
+    monkeypatch.setattr(bot, "STT_LANG", "ta")
+    monkeypatch.setattr(bot, "STT_PROMPT", "Thanglish talk about code.")
+    monkeypatch.setattr(bot, "httpx", _fake_httpx({"text": "ok"}, sent))
+    _run(bot.transcribe(str(f)))
+    assert sent["data"]["language"] == "ta"
+    assert sent["data"]["prompt"] == "Thanglish talk about code."
+
+
+def test_transcribe_bad_key_reported(tmp_path, monkeypatch):
+    f = tmp_path / "voice.ogg"
+    f.write_bytes(b"fake audio")
+    monkeypatch.setattr(bot, "STT_API_KEY", "k")
+    monkeypatch.setattr(bot, "httpx", _fake_httpx({}, {}, status=401))
+    txt, err = _run(bot.transcribe(str(f)))
+    assert txt == ""
+    assert "key" in err
+
+
+def test_transcribe_empty_result_reported(tmp_path, monkeypatch):
+    f = tmp_path / "voice.ogg"
+    f.write_bytes(b"fake audio")
+    monkeypatch.setattr(bot, "STT_API_KEY", "k")
+    monkeypatch.setattr(bot, "httpx", _fake_httpx({"text": "   "}, {}))
+    txt, err = _run(bot.transcribe(str(f)))
+    assert txt == ""
+    assert "no speech" in err
+
+
+def test_transcribe_network_error_reported(tmp_path, monkeypatch):
+    f = tmp_path / "voice.ogg"
+    f.write_bytes(b"fake audio")
+
+    class _Boom:
+        class AsyncClient:
+            def __init__(self, **kw):
+                raise OSError("network down")
+
+    monkeypatch.setattr(bot, "STT_API_KEY", "k")
+    monkeypatch.setattr(bot, "httpx", _Boom)
+    txt, err = _run(bot.transcribe(str(f)))
+    assert txt == ""
+    assert err
+
+
+def test_stt_key_is_scrubbed_from_logs(monkeypatch):
+    monkeypatch.setattr(bot, "STT_API_KEY", "gsk_supersecret")
+    f = bot.TokenScrubFilter()
+    rec = logging.LogRecord(
+        "bot", logging.ERROR, __file__, 1,
+        "STT failed for key gsk_supersecret", None, None,
+    )
+    f.filter(rec)
+    assert "gsk_supersecret" not in rec.getMessage()
+    assert "REDACTED" in rec.getMessage()
